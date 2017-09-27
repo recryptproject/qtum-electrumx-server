@@ -955,6 +955,7 @@ class Fujicoin(Coin):
     RPC_PORT = 3776
 #    REORG_LIMIT = 1000
 
+
 class Qtum(Coin):
     NAME = "Qtum"
     SHORTNAME = "Qtum"
@@ -988,9 +989,10 @@ class Qtum(Coin):
     def electrum_header(cls, header, height):
         version, = struct.unpack('<I', header[:4])
         timestamp, bits, nonce = struct.unpack('<III', header[68:80])
+
         deserializer = cls.DESERIALIZER(header, start=cls.BASIC_HEADER_SIZE)
         sig_length = deserializer.read_varint()
-        return {
+        header = {
             'block_height': height,
             'version': version,
             'prev_block_hash': hash_to_str(header[4:36]),
@@ -1001,15 +1003,16 @@ class Qtum(Coin):
             'hash_state_root': hash_to_str(header[80:112]),
             'hash_utxo_root': hash_to_str(header[112:144]),
             'hash_prevout_stake': hash_to_str(header[144:176]),
-            'hash_prevoit_n': struct.unpack('<I', header[176:180])[0],
-            'sig': binascii.hexlify(bytearray(header[:-sig_length])).decode(),
+            'hash_prevout_n': struct.unpack('<I', header[176:180])[0],
+            'sig': hash_to_str(header[:-sig_length-1:-1]),
         }
+        return header
 
 
 class QtumSkynet(Qtum):
     NET = "skynet"
-    XPUB_VERBYTES = bytes.fromhex("043587cf")
-    XPRV_VERBYTES = bytes.fromhex("04358394")
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
     P2PKH_VERBYTE = bytes.fromhex("3a")
     P2SH_VERBYTES = [bytes.fromhex("32")]
     WIF_BYTE = bytes.fromhex("80")
