@@ -30,7 +30,8 @@ class EnvBase(lib_util.LoggedClass):
         return environ.get(envvar, default)
 
     def boolean(self, envvar, default):
-        return bool(self.default(envvar, default))
+        default = 'Yes' if default else ''
+        return bool(self.default(envvar, default).strip())
 
     def required(self, envvar):
         value = environ.get(envvar)
@@ -41,7 +42,7 @@ class EnvBase(lib_util.LoggedClass):
     def integer(self, envvar, default):
         value = environ.get(envvar)
         if value is None:
-            return default
+            return int(default) if default else default
         try:
             return int(value)
         except Exception:
