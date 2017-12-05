@@ -37,8 +37,7 @@ class MemPool(util.LoggedClass):
         self.controller = controller
         self.coin = bp.coin
         self.db = bp
-        self.touched = bp.touched
-        self.touched_event = asyncio.Event()
+        self.touched = set()
         self.prioritized = set()
         self.stop = False
         self.txs = {}
@@ -49,7 +48,7 @@ class MemPool(util.LoggedClass):
         initial mempool sync.'''
         self.prioritized.add(tx_hash)
 
-    def resync_daemon_hashes(self, unprocessed, unfetched):
+    def _resync_daemon_hashes(self, unprocessed, unfetched):
         '''Re-sync self.txs with the list of hashes in the daemon's mempool.
 
         Additionally, remove gone hashes from unprocessed and
@@ -90,7 +89,7 @@ class MemPool(util.LoggedClass):
         unfetched = set()
         txs = self.txs
         fetch_size = 800
-        process_some = self.async_process_some(unfetched, fetch_size // 2)
+        process_some = self._async_process_some(fetch_size // 2)
 
         await self.daemon.mempool_refresh_event.wait()
         self.logger.info('beginning processing of daemon mempool.  '
@@ -101,7 +100,8 @@ class MemPool(util.LoggedClass):
         while True:
             # Avoid double notifications if processing a block
             if self.touched and not self.processing_new_block():
-                self.touched_event.set()
+                self.controller.notify_sessions(self.touched)
+                self.touched.clear()
 
             # Log progress / state
             todo = len(unfetched) + len(unprocessed)
@@ -122,7 +122,7 @@ class MemPool(util.LoggedClass):
                     self.prioritized.clear()
                     await self.daemon.mempool_refresh_event.wait()
 
-                self.resync_daemon_hashes(unprocessed, unfetched)
+                self._resync_daemon_hashes(unprocessed, unfetched)
                 self.daemon.mempool_refresh_event.clear()
 
                 if unfetched:
@@ -139,7 +139,7 @@ class MemPool(util.LoggedClass):
                 self.stop = True
                 break
 
-    def async_process_some(self, unfetched, limit):
+    def _async_process_some(self, limit):
         pending = []
         txs = self.txs
 
@@ -176,6 +176,16 @@ class MemPool(util.LoggedClass):
                         hashXs[hashX].add(hex_hash)
 
         return process
+
+    def on_new_block(self, touched):
+        '''Called after processing one or more new blocks.
+        Touched is a set of hashXs touched by the transactions in the
+        block.  Caller must be aware it is modified by this function.
+        '''
+        # Minor race condition here with mempool processor thread
+        touched.update(self.touched)
+        self.touched.clear()
+        self.controller.notify_sessions(touched)
 
     def processing_new_block(self):
         '''Return True if we're processing a new block.'''
@@ -260,21 +270,28 @@ class MemPool(util.LoggedClass):
 
         return result, deferred
 
-    async def transactions(self, hashX):
-        '''Generate (hex_hash, tx_fee, unconfirmed) tuples for mempool
-        entries for the hashX.
-
-        unconfirmed is True if any txin is unconfirmed.
+    async def raw_transactions(self, hashX):
+        '''Returns an iterable of (hex_hash, raw_tx) pairs for all
+        transactions in the mempool that touch hashX.
+        raw_tx can be None if the transaction has left the mempool.
         '''
         # hashXs is a defaultdict
         if hashX not in self.hashXs:
             return []
 
-        deserializer = self.coin.DESERIALIZER
         hex_hashes = self.hashXs[hashX]
         raw_txs = await self.daemon.getrawtransactions(hex_hashes)
+        return zip(hex_hashes, raw_txs)
+
+    async def transactions(self, hashX):
+        '''Generate (hex_hash, tx_fee, unconfirmed) tuples for mempool
+        entries for the hashX.
+        unconfirmed is True if any txin is unconfirmed.
+        '''
+        deserializer = self.coin.DESERIALIZER
+        pairs = await self.raw_transactions(hashX)
         result = []
-        for hex_hash, raw_tx in zip(hex_hashes, raw_txs):
+        for hex_hash, raw_tx in pairs:
             item = self.txs.get(hex_hash)
             if not item or not raw_tx:
                 continue
@@ -286,6 +303,22 @@ class MemPool(util.LoggedClass):
                               for txin in tx.inputs)
             result.append((hex_hash, tx_fee, unconfirmed))
         return result
+
+    async def spends(self, hashX):
+        '''Return a set of (prev_hash, prev_idx) pairs from mempool
+        transactions that touch hashX.
+        None, some or all of these may be spends of the hashX.
+        '''
+        deserializer = self.coin.DESERIALIZER
+        pairs = await self.raw_transactions(hashX)
+        spends = set()
+        for hex_hash, raw_tx in pairs:
+            if not raw_tx:
+                continue
+            tx, tx_hash = deserializer(raw_tx).read_tx()
+            for txin in tx.inputs:
+                spends.add((txin.prev_hash, txin.prev_idx))
+        return spends
 
     def value(self, hashX):
         '''Return the unconfirmed amount in the mempool for hashX.

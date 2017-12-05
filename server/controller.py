@@ -213,8 +213,6 @@ class Controller(ServerBase):
         self.ensure_future(self.log_start_external_servers())
         self.ensure_future(self.housekeeping())
         self.ensure_future(self.mempool.main_loop())
-        self.ensure_future(self.notify())
-
 
     def close_servers(self, kinds):
         '''Close the servers of the given kinds (TCP etc.).'''
@@ -273,27 +271,26 @@ class Controller(ServerBase):
             sslc.load_cert_chain(env.ssl_certfile, keyfile=env.ssl_keyfile)
             await self.start_server('SSL', host, env.ssl_port, ssl=sslc)
 
-    async def notify(self):
+    def notify_sessions(self, touched):
         '''Notify sessions about height changes and touched addresses.'''
-        while True:
-            await self.mempool.touched_event.wait()
-            touched = self.mempool.touched.copy()
-            self.mempool.touched.clear()
-            self.mempool.touched_event.clear()
+        # Invalidate caches
+        hc = self.history_cache
+        for hashX in set(hc).intersection(touched):
+            del hc[hashX]
 
-            # Invalidate caches
-            hc = self.history_cache
-            for hashX in set(hc).intersection(touched):
-                del hc[hashX]
-            if self.bp.db_height != self.cache_height:
-                self.cache_height = self.bp.db_height
-                self.header_cache.clear()
+        height = self.bp.db_height
+        if height != self.cache_height:
+            self.cache_height = height
+            self.header_cache.clear()
 
-            # Make a copy; self.sessions can change whilst await-ing
-            sessions = [s for s in self.sessions
-                        if isinstance(s, self.coin.SESSIONCLS)]
-            for session in sessions:
-                await session.notify(self.bp.db_height, touched)
+        # Height notifications are synchronous.  Those sessions with
+        # touched addresses are scheduled for asynchronous completion
+        for session in self.sessions:
+            if isinstance(session, LocalRPC):
+                continue
+            session_touched = session.notify(height, touched)
+            if session_touched is not None:
+                self.ensure_future(session.notify_async(session_touched))
 
     def notify_peers(self, updates):
         '''Notify of peer updates.'''
@@ -476,8 +473,8 @@ class Controller(ServerBase):
             return util.formatted_time(now - t)
 
         now = time.time()
-        fmt = ('{:<30} {:<6} {:>5} {:>5} {:<17} {:>3} '
-               '{:>3} {:>8} {:>11} {:>11} {:>5} {:>20} {:<15}')
+        fmt = ('{:<30} {:<6} {:>5} {:>5} {:<17} {:>4} '
+               '{:>4} {:>8} {:>11} {:>11} {:>5} {:>20} {:<15}')
         yield fmt.format('Host', 'Status', 'TCP', 'SSL', 'Server', 'Min',
                          'Max', 'Pruning', 'Last Good', 'Last Try',
                          'Tries', 'Source', 'IP Address')
@@ -789,24 +786,26 @@ class Controller(ServerBase):
         hashX = self.scripthash_to_hashX(scripthash)
         return await self.unconfirmed_history(hashX)
 
-    async def address_get_proof(self, address):
-        '''Return the UTXO proof of an address.'''
-        hashX = self.address_to_hashX(address)
-        raise RPCError('address.get_proof is not yet implemented')
+    async def hashX_listunspent(self, hashX):
+        '''Return the list of UTXOs of a script hash.
+        We should remove mempool spends from the in-DB UTXOs.'''
+        utxos = await self.get_utxos(hashX)
+        spends = await self.mempool.spends(hashX)
+
+        return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
+                 'height': utxo.height, 'value': utxo.value}
+                for utxo in sorted(utxos)
+                if (utxo.tx_hash, utxo.tx_pos) not in spends]
 
     async def address_listunspent(self, address):
         '''Return the list of UTXOs of an address.'''
         hashX = self.address_to_hashX(address)
-        return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
-                for utxo in sorted(await self.get_utxos(hashX))]
+        return await self.hashX_listunspent(hashX)
 
     async def scripthash_listunspent(self, scripthash):
         '''Return the list of UTXOs of a scripthash.'''
         hashX = self.scripthash_to_hashX(scripthash)
-        return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
-                for utxo in sorted(await self.get_utxos(hashX))]
+        return await self.hashX_listunspent(hashX)
 
     def block_get_header(self, height):
         '''The deserialized header at a given height.
@@ -879,3 +878,6 @@ class Controller(ServerBase):
         if index >= len(tx.outputs):
             return None
         return self.coin.address_from_script(tx.outputs[index].pk_script)
+
+    async def call_contract(self, address, data, sender):
+        return await self.daemon_request('callcontract', address, data, sender)
