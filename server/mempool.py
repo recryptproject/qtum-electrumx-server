@@ -312,7 +312,7 @@ class MemPool(util.LoggedClass):
             txout_pairs = item[1]
             for pos, (hX, value) in enumerate(txout_pairs):
                 if hX == hashX:
-                    utxos.append(UTXO(-1, pos, hex_hash, 0, value))
+                    utxos.append(UTXO(-1, pos, hex_str_to_hash(hex_hash), 0, value))
         return utxos
 
     async def potential_spends(self, hashX):
