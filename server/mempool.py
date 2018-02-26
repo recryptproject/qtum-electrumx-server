@@ -15,6 +15,7 @@ from collections import defaultdict
 from lib.hash import hash_to_str, hex_str_to_hash
 import lib.util as util
 from server.daemon import DaemonError
+from server.db import UTXO
 
 
 class MemPool(util.LoggedClass):
@@ -296,21 +297,39 @@ class MemPool(util.LoggedClass):
             result.append((hex_hash, tx_fee, unconfirmed))
         return result
 
-    async def spends(self, hashX):
+    def get_utxos(self, hashX):
+        '''Return an unordered list of UTXO named tuples from mempool
+        transactions that pay to hashX.
+        This does not consider if any other mempool transactions spend
+        the outputs.
+        '''
+        utxos = []
+        # hashXs is a defaultdict, so use get() to query
+        for hex_hash in self.hashXs.get(hashX, []):
+            item = self.txs.get(hex_hash)
+            if not item:
+                continue
+            txout_pairs = item[1]
+            for pos, (hX, value) in enumerate(txout_pairs):
+                if hX == hashX:
+                    utxos.append(UTXO(-1, pos, hex_hash, 0, value))
+        return utxos
+
+    async def potential_spends(self, hashX):
         '''Return a set of (prev_hash, prev_idx) pairs from mempool
         transactions that touch hashX.
         None, some or all of these may be spends of the hashX.
         '''
         deserializer = self.coin.DESERIALIZER
         pairs = await self.raw_transactions(hashX)
-        spends = set()
+        result = set()
         for hex_hash, raw_tx in pairs:
             if not raw_tx:
                 continue
-            tx, tx_hash = deserializer(raw_tx).read_tx()
+            tx = deserializer(raw_tx).read_tx()
             for txin in tx.inputs:
-                spends.add((txin.prev_hash, txin.prev_idx))
-        return spends
+                result.add((txin.prev_hash, txin.prev_idx))
+        return result
 
     def value(self, hashX):
         '''Return the unconfirmed amount in the mempool for hashX.
