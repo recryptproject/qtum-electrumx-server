@@ -14,8 +14,7 @@ import traceback
 from bisect import bisect_left
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-
+from functools import partial, wraps
 import pylru
 
 from lib.jsonrpc import JSONSessionBase, RPCError
@@ -271,7 +270,7 @@ class Controller(ServerBase):
             sslc.load_cert_chain(env.ssl_certfile, keyfile=env.ssl_keyfile)
             await self.start_server('SSL', host, env.ssl_port, ssl=sslc)
 
-    def notify_sessions(self, touched):
+    def notify_sessions(self, touched, eventlog_touched=None):
         '''Notify sessions about height changes and touched addresses.'''
         # Invalidate caches
         hc = self.history_cache
@@ -288,9 +287,9 @@ class Controller(ServerBase):
         for session in self.sessions:
             if isinstance(session, LocalRPC):
                 continue
-            session_touched = session.notify(height, touched)
-            if session_touched is not None:
-                self.ensure_future(session.notify_async(session_touched))
+            session_touched, session_eventlog_touched = session.notify(height, touched, eventlog_touched)
+            if session_touched is not None or session_eventlog_touched is not None:
+                self.ensure_future(session.notify_async(session_touched, session_eventlog_touched))
 
     def notify_peers(self, updates):
         '''Notify of peer updates.'''
@@ -881,5 +880,64 @@ class Controller(ServerBase):
             return None
         return self.coin.address_from_script(tx.outputs[index].pk_script)
 
-    async def call_contract(self, address, data, sender):
-        return await self.daemon_request('callcontract', address, data, sender)
+    async def contract_call(self, address, data, sender='', result_type=None):
+        result = await self.daemon_request('callcontract', address, data, sender)
+        return util.parse_call_output(result, result_type)
+
+    async def transaction_get_receipt(self, txid):
+        return await self.daemon_request('gettransactionreceipt', txid)
+
+    # class MyCache(object):
+    #     def __init__(self, maxcount):
+    #         self.count = 0
+    #         self.maxcount = maxcount
+    #         self.cache = {}
+    #
+    #     def __call__(self, func):
+    #
+    #         @wraps(func)
+    #         def wrapped(*args):
+    #             if self.count > self.maxcount:
+    #                 self.cache = {}
+    #                 self.count = 0
+    #                 result = self.cache[args] = func(*args)
+    #             else:
+    #                 try:
+    #                     result = self.cache[args]
+    #                     self.count += 1
+    #                 except KeyError:
+    #                     result = self.cache[args] = func(*args)
+    #             return result
+    #         return wrapped
+    #
+    # @MyCache(256)
+
+    async def token_get_info(self, token_address):
+        name = await self.contract_call(token_address, '06fdde03', result_type=str)
+        decimals = await self.contract_call(token_address, '313ce567', result_type=int)
+        total_supply = await self.contract_call(token_address, '18160ddd', result_type=int)
+        symbol = await self.contract_call(token_address, '95d89b41', result_type=str)
+        return {
+            'name': name,
+            'decimals': decimals,
+            'total_supply': total_supply,
+            'symbol': symbol
+        }
+
+    async def get_eventlogs(self, hashY):
+        def job():
+            # History DoS limit.  Each element of history is about 99
+            # bytes when encoded as JSON.  This limits resource usage
+            # on bloated history requests, and uses a smaller divisor
+            # so large requests are logged before refusing them.
+            limit = self.env.max_send // 97
+            return list(self.bp.get_eventlog(hashY, limit=limit))
+        eventlogs = await self.run_in_executor(job)
+        return eventlogs
+
+    async def hash160_contract_get_eventlogs(self, hash160, contract_addr):
+        hashY = self.coin.hash160_contract_to_hashY(hash160, contract_addr)
+        eventlogs = await self.get_eventlogs(hashY)
+        conf = [{'tx_hash': hash_to_str(tx_hash), 'height': height}
+                for tx_hash, height in eventlogs]
+        return conf

@@ -7,18 +7,16 @@
 # and warranty status of this software.
 
 '''Block prefetcher and chain processor.'''
-
-
 import array
 import asyncio
 from struct import pack, unpack
 import time
 from collections import defaultdict
-from functools import partial
+from functools import partial, reduce
 
 from server.daemon import DaemonError
 from server.version import VERSION
-from lib.hash import hash_to_str
+from lib.hash import hash_to_str, hash_to_hex_str
 from lib.util import chunks, formatted_time, LoggedClass
 import server.db
 
@@ -93,6 +91,7 @@ class Prefetcher(LoggedClass):
                 cache_room = self.min_cache_size // self.ave_size
                 count = min(daemon_height - self.fetched_height, cache_room)
                 count = min(500, max(count, 0))
+
                 if not count:
                     if not self.caught_up:
                         self.caught_up = True
@@ -105,7 +104,7 @@ class Prefetcher(LoggedClass):
                     self.logger.info('new block height {:,d} hash {}'
                                      .format(first + count-1, hex_hashes[-1]))
                 blocks = await daemon.raw_blocks(hex_hashes)
-
+                eventlogs = await daemon.searchlogs(first, first+count)
                 assert count == len(blocks)
 
                 # Special handling for genesis block
@@ -121,7 +120,8 @@ class Prefetcher(LoggedClass):
                 else:
                     self.ave_size = (size + (10 - count) * self.ave_size) // 10
 
-                self.bp.on_prefetched_blocks(blocks, first)
+                self.bp.on_prefetched_blocks(blocks, eventlogs, first)
+
                 self.cache_size += size
                 self.fetched_height += count
 
@@ -178,6 +178,11 @@ class BlockProcessor(server.db.DB):
         self.utxo_cache = {}
         self.db_deletes = []
 
+        # eventlogs
+        self.eventlogs = defaultdict(partial(array.array, 'I'))
+        self.eventlogs_size = 0
+        self.eventlog_touched = set()
+
         self.prefetcher = Prefetcher(self)
 
         if self.utxo_db.for_sync:
@@ -188,9 +193,9 @@ class BlockProcessor(server.db.DB):
         '''Add the task to our task queue.'''
         self.task_queue.put_nowait(task)
 
-    def on_prefetched_blocks(self, blocks, first):
+    def on_prefetched_blocks(self, blocks, eventlogs, first):
         '''Called by the prefetcher when it has prefetched some blocks.'''
-        self.add_task(partial(self.check_and_advance_blocks, blocks, first))
+        self.add_task(partial(self.check_and_advance_blocks, blocks, eventlogs, first))
 
     def on_prefetcher_first_caught_up(self):
         '''Called by the prefetcher when it first catches up.'''
@@ -225,7 +230,7 @@ class BlockProcessor(server.db.DB):
         self.open_dbs()
         self.caught_up_event.set()
 
-    async def check_and_advance_blocks(self, raw_blocks, first):
+    async def check_and_advance_blocks(self, raw_blocks, eventlogs, first):
         '''Process the list of raw blocks passed.  Detects and handles
         reorgs.
         '''
@@ -247,14 +252,15 @@ class BlockProcessor(server.db.DB):
 
         if hprevs == chain:
             start = time.time()
-            await self.controller.run_in_executor(self.advance_blocks, blocks)
+            await self.controller.run_in_executor(self.advance_blocks, blocks, eventlogs)
             if not self.first_sync:
                 s = '' if len(blocks) == 1 else 's'
                 self.logger.info('processed {:,d} block{} in {:.1f}s'
                                  .format(len(blocks), s,
                                          time.time() - start))
-                self.controller.mempool.on_new_block(self.touched)
+                self.controller.mempool.on_new_block(self.touched, self.eventlog_touched)
             self.touched.clear()
+            self.eventlog_touched.clear()
         elif hprevs[0] != chain[0]:
             await self.reorg_chain()
         else:
@@ -288,12 +294,14 @@ class BlockProcessor(server.db.DB):
             self.logger.info('faking a reorg of {:,d} blocks'.format(count))
         await self.controller.run_in_executor(self.flush, True)
 
-        hashes = await self.reorg_hashes(count)
+        hashes, start, count = await self.reorg_hashes(count)
         # Reverse and convert to hex strings.
         hashes = [hash_to_str(hash) for hash in reversed(hashes)]
+        eventlogs = await self.daemon.searchlogs(start, start + count - 1)
+        eventlog_dict = self.eventlogs_to_dict(eventlogs)
         for hex_hashes in chunks(hashes, 50):
             blocks = await self.daemon.raw_blocks(hex_hashes)
-            await self.controller.run_in_executor(self.backup_blocks, blocks)
+            await self.controller.run_in_executor(self.backup_blocks, blocks, eventlog_dict)
         await self.prefetcher.reset_height()
 
     async def reorg_hashes(self, count):
@@ -333,7 +341,7 @@ class BlockProcessor(server.db.DB):
                          'heights {:,d}-{:,d}'
                          .format(count, s, start, start + count - 1))
 
-        return self.fs_block_hashes(start, count)
+        return self.fs_block_hashes(start, count), start, count
 
     def flush_state(self, batch):
         '''Flush chain state to the batch.'''
@@ -349,6 +357,7 @@ class BlockProcessor(server.db.DB):
         assert self.height == self.fs_height == self.db_height
         assert not self.undo_infos
         assert not self.history
+        assert not self.eventlogs
         assert not self.utxo_cache
         assert not self.db_deletes
 
@@ -378,6 +387,14 @@ class BlockProcessor(server.db.DB):
                              .format(time.time() - fs_end, len(self.history)))
         self.history = defaultdict(partial(array.array, 'I'))
         self.history_size = 0
+
+        # eventlog
+        self.flush_eventlog(self.eventlogs)
+        if self.utxo_db.for_sync:
+            self.logger.info('flushed eventlog in {:.1f}s for {:,d} addrs'
+                             .format(time.time() - fs_end, len(self.eventlogs)))
+        self.eventlogs = defaultdict(partial(array.array, 'I'))
+        self.eventlogs_size = 0
 
         # Flush state last as it reads the wall time.
         with self.utxo_db.write_batch() as batch:
@@ -438,6 +455,7 @@ class BlockProcessor(server.db.DB):
         '''
         assert self.height < self.db_height
         assert not self.history
+        assert not self.eventlogs
 
         flush_start = time.time()
 
@@ -453,6 +471,11 @@ class BlockProcessor(server.db.DB):
         nremoves = self.backup_history(self.touched)
         self.logger.info('backing up removed {:,d} history entries'
                          .format(nremoves))
+
+        self.eventlog_touched.discard(None)
+        n_eventlogs = self.backup_eventlogs(self.eventlog_touched)
+        self.logger.info('backing up removed {:,d} eventlog entries'
+                         .format(n_eventlogs))
 
         with self.utxo_db.write_batch() as batch:
             # Flush state last as it reads the wall time.
@@ -473,33 +496,37 @@ class BlockProcessor(server.db.DB):
         utxo_cache_size = len(self.utxo_cache) * 205
         db_deletes_size = len(self.db_deletes) * 57
         hist_cache_size = len(self.history) * 180 + self.history_size * 4
+        eventlog_cache_size = len(self.eventlogs) * 180 + self.eventlogs_size * 4
         # Roughly ntxs * 32 + nblocks * 42
         tx_hash_size = ((self.tx_count - self.fs_tx_count) * 32
                         + (self.height - self.fs_height) * 42)
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
         hist_MB = (hist_cache_size + tx_hash_size) // one_MB
+        eventlog_MB = (eventlog_cache_size + tx_hash_size) // one_MB
 
         self.logger.info('our height: {:,d} daemon: {:,d} '
-                         'UTXOs {:,d}MB hist {:,d}MB'
+                         'UTXOs {:,d}MB hist {:,d}MB eventlog {:,d}MB'
                          .format(self.height, self.daemon.cached_height(),
-                                 utxo_MB, hist_MB))
+                                 utxo_MB, hist_MB, eventlog_MB))
 
         # Flush history if it takes up over 20% of cache memory.
+        # Flush eventlog if it takes up over 33% of cache memory
         # Flush UTXOs once they take up 80% of cache memory.
-        if utxo_MB + hist_MB >= self.cache_MB or hist_MB >= self.cache_MB // 5:
+        if utxo_MB + hist_MB >= self.cache_MB or hist_MB >= self.cache_MB // 5 or eventlog_MB >= self.cache_MB // 3:
             self.flush(utxo_MB >= self.cache_MB * 4 // 5)
 
-    def advance_blocks(self, blocks):
+    def advance_blocks(self, blocks, eventlogs):
         '''Synchronously advance the blocks.
 
         It is already verified they correctly connect onto our tip.
         '''
         min_height = self.min_undo_height(self.daemon.cached_height())
         height = self.height
+        eventlog_dict = self.eventlogs_to_dict(eventlogs)
 
         for block in blocks:
             height += 1
-            undo_info = self.advance_txs(block.transactions)
+            undo_info = self.advance_txs(block.transactions, eventlog_dict)
             if height >= min_height:
                 self.undo_infos.append((undo_info, height))
 
@@ -517,7 +544,7 @@ class BlockProcessor(server.db.DB):
                 self.check_cache_size()
                 self.next_cache_check = time.time() + 30
 
-    def advance_txs(self, txs):
+    def advance_txs(self, txs, eventlog_dict):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
         # Use local vars for speed in the loops
@@ -532,10 +559,21 @@ class BlockProcessor(server.db.DB):
         undo_info_append = undo_info.append
         touched = self.touched
 
+        eventlogs = self.eventlogs
+        eventlog_touched = self.eventlog_touched
+        eventlogs_size = self.eventlogs_size
+
         for tx, tx_hash in txs:
             hashXs = set()
             add_hashX = hashXs.add
             tx_numb = s_pack('<I', tx_num)
+
+            # eventlog
+            hashYs = eventlog_dict.get(hash_to_hex_str(tx_hash), [])
+            for hashY in hashYs:
+                eventlogs[hashY].append(tx_num)
+                eventlog_touched.add(hashY)
+            eventlogs_size += len(hashYs)
 
             # Spend the inputs
             if not tx.is_coinbase:
@@ -562,10 +600,39 @@ class BlockProcessor(server.db.DB):
         self.tx_count = tx_num
         self.tx_counts.append(tx_num)
         self.history_size = history_size
+        self.eventlogs_size = eventlogs_size
 
         return undo_info
 
-    def backup_blocks(self, raw_blocks):
+    def eventlogs_to_dict(self, eventlogs):
+        '''
+        key: string txid
+        value: bytes[] , hashY
+        '''
+        hash160_contract_to_hashY = self.coin.hash160_contract_to_hashY
+        eventlog_dict = defaultdict(set)
+        for eventlog in eventlogs:
+            txid = eventlog.get('transactionHash')
+            if not txid:
+                continue
+            for log in eventlog.get('log', []):
+                if not isinstance(log, dict):
+                    print('log not dict')
+                    continue
+                contract_addr = log.get('address')
+                if not contract_addr:
+                    continue
+                for topic_data in log.get('topics', []):
+                    # only need address type
+                    if len(topic_data) == 64 \
+                            and topic_data.startswith('0'*24) \
+                            and not topic_data.startswith('0'*48):
+                        hash160 = topic_data[-40:]
+                        hashY = hash160_contract_to_hashY(hash160, contract_addr)
+                        eventlog_dict[txid].add(hashY)
+        return eventlog_dict
+
+    def backup_blocks(self, raw_blocks, eventlog_dict):
         '''Backup the raw blocks and flush.
 
         The blocks should be in order of decreasing height, starting at.
@@ -573,8 +640,12 @@ class BlockProcessor(server.db.DB):
         '''
         self.assert_flushed()
         assert self.height >= len(raw_blocks)
-
         coin = self.coin
+
+        for txid, keys in eventlog_dict.items():
+            for key in keys:
+                self.eventlog_touched.add(key)
+
         for raw_block in raw_blocks:
             # Check and update self.tip
             block = coin.block(raw_block, self.height)
@@ -754,6 +825,7 @@ class BlockProcessor(server.db.DB):
 
         # New undo information
         self.flush_undo_infos(batch_put, self.undo_infos)
+        # print('>>>flush_undo_infos', self.undo_infos)
         self.undo_infos = []
 
         if self.utxo_db.for_sync:
