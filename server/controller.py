@@ -913,10 +913,10 @@ class Controller(ServerBase):
     # @MyCache(256)
 
     async def token_get_info(self, token_address):
-        name = await self.contract_call(token_address, '06fdde03', result_type=str)
-        decimals = await self.contract_call(token_address, '313ce567', result_type=int)
-        total_supply = await self.contract_call(token_address, '18160ddd', result_type=int)
-        symbol = await self.contract_call(token_address, '95d89b41', result_type=str)
+        name = await self.contract_call(token_address, '06fdde03', result_type='str')
+        decimals = await self.contract_call(token_address, '313ce567', result_type='int')
+        total_supply = await self.contract_call(token_address, '18160ddd', result_type='int')
+        symbol = await self.contract_call(token_address, '95d89b41', result_type='str')
         return {
             'name': name,
             'decimals': decimals,
