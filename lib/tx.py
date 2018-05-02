@@ -337,7 +337,7 @@ class DeserializerReddcoin(Deserializer):
         ), double_sha256(self.binary[start:self.cursor])
 
 
-class DeserializerQtum(DeserializerSegWit):
+class DeserializerRecrypt(DeserializerSegWit):
 
     def read_varint(self):
         '''

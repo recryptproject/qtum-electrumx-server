@@ -322,7 +322,7 @@ class ElectrumX(SessionBase):
 
     async def banner(self):
         '''Return the server banner text.'''
-        banner = 'Welcome to Qtum Electrum!'
+        banner = 'Welcome to Recrypt Electrum!'
 
         if self.is_tor():
             banner_file = self.env.tor_banner_file

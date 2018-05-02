@@ -41,9 +41,9 @@ import lib.util as util
 from lib.hash import Base58, hash160, double_sha256, hash_to_str, hex_str_to_hash
 from lib.script import ScriptPubKey, OpCodes
 from lib.tx import Deserializer, DeserializerSegWit, DeserializerAuxPow, \
-    DeserializerZcash, DeserializerTxTime, DeserializerReddcoin, DeserializerQtum
+    DeserializerZcash, DeserializerTxTime, DeserializerReddcoin, DeserializerRecrypt
 from server.block_processor import BlockProcessor
-from server.daemon import Daemon, DashDaemon, LegacyRPCDaemon, FujiDaemon, QtumDaemon
+from server.daemon import Daemon, DashDaemon, LegacyRPCDaemon, FujiDaemon, RecryptDaemon
 from server.session import ElectrumX, DashElectrumX
 
 
@@ -932,9 +932,9 @@ class Fujicoin(Coin):
 #    REORG_LIMIT = 1000
 
 
-class Qtum(Coin):
-    NAME = "Qtum"
-    SHORTNAME = "Qtum"
+class Recrypt(Coin):
+    NAME = "Recrypt"
+    SHORTNAME = "Recrypt"
     NET = "mainnet"
     XPUB_VERBYTES = bytes.fromhex("0488b21e")
     XPRV_VERBYTES = bytes.fromhex("0488ade4")
@@ -945,11 +945,11 @@ class Qtum(Coin):
     TX_COUNT = 217380620
     TX_COUNT_HEIGHT = 464000
     TX_PER_BLOCK = 1800
-    RPC_PORT = 3889
+    RPC_PORT = 8489
     PEER_DEFAULT_PORTS = {'t': '50001', 's': '50002'}
     PEERS = []
-    DAEMON = QtumDaemon
-    DESERIALIZER = DeserializerQtum
+    DAEMON = RecryptDaemon
+    DESERIALIZER = DeserializerRecrypt
     STATIC_BLOCK_HEADERS = False
     BASIC_HEADER_SIZE = 180
     POW_BLOCK_COUNT = 5000
@@ -985,7 +985,7 @@ class Qtum(Coin):
         return header
 
 
-class QtumTestnet(Qtum):
+class RecryptTestnet(Recrypt):
     NET = "testnet"
     XPUB_VERBYTES = bytes.fromhex("043587CF")
     XPRV_VERBYTES = bytes.fromhex("04358394")
@@ -994,12 +994,12 @@ class QtumTestnet(Qtum):
     TX_COUNT = 12242438
     TX_COUNT_HEIGHT = 1035428
     TX_PER_BLOCK = 21
-    RPC_PORT = 13889
+    RPC_PORT = 18489
     PEERS = []
     PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
 
 
-class QtumSkynet(Qtum):
+class RecryptSkynet(Recrypt):
     NET = "skynet"
     XPUB_VERBYTES = bytes.fromhex("0488B21E")
     XPRV_VERBYTES = bytes.fromhex("0488ADE4")
@@ -1008,6 +1008,6 @@ class QtumSkynet(Qtum):
     TX_COUNT = 12242438
     TX_COUNT_HEIGHT = 1035428
     TX_PER_BLOCK = 21
-    RPC_PORT = 3889
+    RPC_PORT = 8489
     PEERS = []
     PEER_DEFAULT_PORTS = {'t': '52001', 's': '52002'}

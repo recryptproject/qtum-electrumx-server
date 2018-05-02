@@ -377,7 +377,7 @@ class LegacyRPCDaemon(Daemon):
         return t if isinstance(t, int) else timegm(strptime(t, "%Y-%m-%d %H:%M:%S %Z"))
 
 
-class QtumDaemon(Daemon):
+class RecryptDaemon(Daemon):
 
     async def callcontract(self, address, data, sender):
         return await self._send_single('callcontract', (address, data, sender))

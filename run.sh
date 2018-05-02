@@ -3,7 +3,7 @@
 
 ulimit -n 65535
 
-export COIN=Qtum
+export COIN=Recrypt
 export DAEMON_URL=http://user:password@127.0.0.1
 export NET=mainnet
 export DB_DIRECTORY=$HOME/.electrumx/db
